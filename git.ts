@@ -44,7 +44,11 @@ export interface TreeEntry {
   oid: string;
 }
 
+const treeParseCache = new WeakMap<Buffer, TreeEntry[]>();
+
 export function parseTree(buf: Buffer): TreeEntry[] {
+  const cached = treeParseCache.get(buf);
+  if (cached) return cached;
   const out: TreeEntry[] = [];
   let i = 0;
   while (i < buf.length) {
@@ -56,6 +60,7 @@ export function parseTree(buf: Buffer): TreeEntry[] {
     out.push({ mode, name, oid });
     i = nul + 21;
   }
+  treeParseCache.set(buf, out);
   return out;
 }
 
@@ -122,7 +127,11 @@ export interface CommitInfo {
   message: string;
 }
 
+const commitParseCache = new WeakMap<Buffer, CommitInfo>();
+
 export function parseCommit(buf: Buffer): CommitInfo {
+  const cached = commitParseCache.get(buf);
+  if (cached) return cached;
   const text = buf.toString('utf8');
   const split = text.indexOf('\n\n');
   const head = split === -1 ? text : text.slice(0, split);
@@ -134,6 +143,7 @@ export function parseCommit(buf: Buffer): CommitInfo {
     else if (line.startsWith('author ')) info.author = line.slice(7);
     else if (line.startsWith('committer ')) info.committer = line.slice(10);
   }
+  commitParseCache.set(buf, info);
   return info;
 }
 
@@ -197,6 +207,26 @@ export function ancestors(store: ObjectStore, tip: string): string[] {
     for (const p of parseCommit(obj.buf).parents) queue.push(p);
   }
   return order;
+}
+
+/** Whether `anc` is `desc` itself or one of its ancestors; walks from `desc` and stops at the first hit. */
+export function isAncestor(store: ObjectStore, anc: string, desc: string): boolean {
+  if (anc === desc) return true;
+  const seen = new Set<string>([desc]);
+  const stack = [desc];
+  while (stack.length > 0) {
+    const cur = stack.pop() as string;
+    const obj = store.get(cur);
+    if (!obj || obj.type !== 'commit') continue;
+    for (const p of parseCommit(obj.buf).parents) {
+      if (p === anc) return true;
+      if (!seen.has(p)) {
+        seen.add(p);
+        stack.push(p);
+      }
+    }
+  }
+  return false;
 }
 
 /** The merge base of two commits: their first common ancestor in breadth-first order from b. */
@@ -351,6 +381,18 @@ export function parsePack(store: ObjectStore, pack: Buffer): number {
 }
 
 /** Build a packfile holding the given objects whole (no deltas); the caller picks the set. */
+const deflateCache = new WeakMap<Buffer, Buffer>();
+
+/** Deflate an object body once; stored object buffers are immutable, so the result is reusable. */
+function deflateCached(buf: Buffer): Buffer {
+  let out = deflateCache.get(buf);
+  if (!out) {
+    out = deflateSync(buf);
+    deflateCache.set(buf, out);
+  }
+  return out;
+}
+
 export function buildPack(store: ObjectStore, oids: readonly string[]): Buffer {
   const head = Buffer.alloc(12);
   head.write('PACK', 0, 'utf8');
@@ -374,7 +416,7 @@ export function buildPack(store: ObjectStore, oids: readonly string[]): Buffer {
       bytes.push(b);
     }
     parts.push(Buffer.from(bytes));
-    parts.push(deflateSync(obj.buf));
+    parts.push(deflateCached(obj.buf));
   }
   const body = Buffer.concat(parts);
   const trailer = createHash('sha1').update(body).digest();

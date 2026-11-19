@@ -6,6 +6,7 @@ import {
   buildCommit,
   buildPack,
   flattenTree,
+  isAncestor,
   mergeBase,
   parseCommit,
   parsePack,
@@ -1043,7 +1044,7 @@ async function handleReceivePack(res: ServerResponse, repo: RepoRec, raw: Buffer
       }
       if (current !== ZERO_OID) {
         const currentCommit = peelToCommit(store.objects, current);
-        if (!currentCommit || !ancestors(store.objects, newCommit).includes(currentCommit)) {
+        if (!currentCommit || !isAncestor(store.objects, currentCommit, newCommit)) {
           fail('non-fast-forward');
           continue;
         }
