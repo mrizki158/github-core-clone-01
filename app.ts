@@ -20,8 +20,9 @@ import {
   storeTreeFromFiles,
 } from './git.ts';
 import { branchRef, nowIso, refTip, shortRef, Store, VIEWER, viewerIdent, type IssueRec, type PullRec, type RepoRec } from './store.ts';
-import { addCommentRecord, createIssueRecord, performMerge, pullFilesList } from './core.ts';
+import { addCommentRecord, createIssueRecord, issueJson, performMerge, pullFilesList, pullJson, repoJson, userJson } from './core.ts';
 import { executeGraphQL } from './graphql.ts';
+import { handleMcp as handleMcpRequest } from './mcp.ts';
 
 const store = new Store();
 const TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
@@ -95,81 +96,6 @@ function str(value: unknown): string {
 }
 
 // ---------------------------------------------------------------- JSON shapes
-
-function userJson(login: string): Record<string, unknown> {
-  const isViewer = login === VIEWER.login;
-  return {
-    login,
-    id: isViewer ? VIEWER.id : 0,
-    type: 'User',
-    name: isViewer ? VIEWER.name : login,
-    email: isViewer ? VIEWER.email : `${login}@example.invalid`,
-  };
-}
-
-function repoJson(repo: RepoRec): Record<string, unknown> {
-  return {
-    id: repo.id,
-    name: repo.name,
-    full_name: `${repo.owner}/${repo.name}`,
-    owner: userJson(repo.owner),
-    private: repo.private,
-    description: repo.description,
-    default_branch: repo.default_branch,
-    html_url: `http://forge.local/${repo.owner}/${repo.name}`,
-    clone_url: `http://forge.local/${repo.owner}/${repo.name}.git`,
-    created_at: repo.created_at,
-    updated_at: repo.updated_at,
-    fork: false,
-    archived: false,
-    disabled: false,
-  };
-}
-
-function labelJson(repo: RepoRec, name: string): Record<string, unknown> {
-  const rec = repo.labels.get(name);
-  return { name, color: rec?.color ?? 'ededed', default: true, description: null };
-}
-
-function issueJson(repo: RepoRec, issue: IssueRec): Record<string, unknown> {
-  return {
-    id: repo.id * 1000000 + issue.number,
-    number: issue.number,
-    title: issue.title,
-    body: issue.body,
-    state: issue.state,
-    labels: issue.labels.map((name) => labelJson(repo, name)),
-    user: userJson(issue.user),
-    comments: issue.comments.length,
-    created_at: issue.created_at,
-    updated_at: issue.updated_at,
-    closed_at: issue.closed_at,
-  };
-}
-
-function refJson(repo: RepoRec, refName: string, sha: string): Record<string, unknown> {
-  return { ref: shortRef(refName), sha, label: `${repo.owner}:${shortRef(refName)}`, user: userJson(repo.owner), repo: repoJson(repo) };
-}
-
-function pullJson(repo: RepoRec, pull: PullRec): Record<string, unknown> {
-  return {
-    id: repo.id * 1000000 + pull.number,
-    number: pull.number,
-    state: pull.state,
-    title: pull.title,
-    body: pull.body,
-    user: userJson(pull.user),
-    head: refJson(repo, pull.headRef, pull.headSha),
-    base: refJson(repo, pull.baseRef, pull.baseSha),
-    merged: pull.merged,
-    merged_at: pull.merged_at,
-    merge_commit_sha: pull.merge_commit_sha,
-    draft: false,
-    created_at: pull.created_at,
-    updated_at: pull.updated_at,
-    closed_at: pull.merged ? pull.merged_at : null,
-  };
-}
 
 function identParts(ident: string): { name: string; email: string; date: string } {
   const match = /^(.*) <(.*)> (\d+) ([+-]\d{4})$/.exec(ident);
@@ -787,8 +713,18 @@ function handleGraphql(_req: IncomingMessage, res: ServerResponse, raw: Buffer):
   sendJson(res, reply.status, reply.body);
 }
 
-function handleMcp(_req: IncomingMessage, res: ServerResponse, _raw: Buffer): void {
-  sendJson(res, 404, { message: 'Not Found' });
+function handleMcp(req: IncomingMessage, res: ServerResponse, raw: Buffer): void {
+  if ((req.method ?? 'GET') !== 'POST') {
+    sendJson(res, 405, { message: 'Method Not Allowed' });
+    return;
+  }
+  const reply = handleMcpRequest(store, raw);
+  if (reply.body === undefined) {
+    res.writeHead(reply.status, { 'x-github-request-id': requestId() });
+    res.end();
+    return;
+  }
+  sendJson(res, reply.status, reply.body);
 }
 
 // ---------------------------------------------------------------- git smart HTTP
