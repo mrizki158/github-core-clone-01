@@ -55,7 +55,17 @@ const REASONS: Record<number, string> = {
   500: 'Internal Server Error',
 };
 
-const REQUEST_LINE = /^([A-Z]+) (\S+) HTTP\/\d\.\d$/;
+const HTTP_VERSION = 'HTTP/';
+
+/** Parse the request line without a regex: METHOD SP TARGET SP HTTP/x.y. */
+function parseRequestLine(line: string): { method: string; url: string } | null {
+  const sp1 = line.indexOf(' ');
+  if (sp1 <= 0) return null;
+  const sp2 = line.indexOf(' ', sp1 + 1);
+  if (sp2 <= sp1 + 1) return null;
+  if (!line.startsWith(HTTP_VERSION, sp2 + 1)) return null;
+  return { method: line.slice(0, sp1), url: line.slice(sp1 + 1, sp2) };
+}
 
 /** A parsed request head: everything before the body. */
 interface Head {
@@ -76,27 +86,34 @@ function parseHead(buf: Buffer): ParseHead {
   const headText = buf.toString('latin1', 0, headEnd);
   const lineEnd = headText.indexOf('\r\n');
   const line = lineEnd === -1 ? headText : headText.slice(0, lineEnd);
-  const match = REQUEST_LINE.exec(line);
-  if (!match) return { kind: 'bad' };
+  const requestLine = parseRequestLine(line);
+  if (!requestLine) return { kind: 'bad' };
   const headers: Record<string, string | string[] | undefined> = {};
   let contentLength = 0;
   let expectContinue = false;
   if (lineEnd !== -1) {
-    for (const h of headText.slice(lineEnd + 2).split('\r\n')) {
+    let pos = lineEnd + 2;
+    while (pos < headText.length) {
+      const eol = headText.indexOf('\r\n', pos);
+      const h = eol === -1 ? headText.slice(pos) : headText.slice(pos, eol);
+      if (h === '') break;
       const colon = h.indexOf(':');
-      if (colon <= 0) continue;
-      const name = h.slice(0, colon).trim().toLowerCase();
-      const value = h.slice(colon + 1).trim();
-      if (name === 'content-length') contentLength = Number(value) || 0;
-      else if (name === 'transfer-encoding' && value.toLowerCase().includes('chunked')) return { kind: 'bad' };
-      else if (name === 'expect' && value.toLowerCase().includes('100-continue')) expectContinue = true;
-      const prev = headers[name];
-      headers[name] = prev === undefined ? value : Array.isArray(prev) ? [...prev, value] : [prev, value];
+      if (colon > 0) {
+        const name = h.slice(0, colon).trim().toLowerCase();
+        const value = h.slice(colon + 1).trim();
+        if (name === 'content-length') contentLength = Number(value) || 0;
+        else if (name === 'transfer-encoding' && value.toLowerCase().includes('chunked')) return { kind: 'bad' };
+        else if (name === 'expect' && value.toLowerCase().includes('100-continue')) expectContinue = true;
+        const prev = headers[name];
+        headers[name] = prev === undefined ? value : Array.isArray(prev) ? [...prev, value] : [prev, value];
+      }
+      if (eol === -1) break;
+      pos = eol + 2;
     }
   }
   return {
     kind: 'head',
-    head: { method: match[1] as string, url: match[2] as string, headers, contentLength, expectContinue, headEnd },
+    head: { method: requestLine.method, url: requestLine.url, headers, contentLength, expectContinue, headEnd },
   };
 }
 
@@ -191,7 +208,7 @@ function pump(conn: Conn): void {
     }
     conn.answered100 = false;
     const body = head.contentLength > 0 ? Buffer.from(conn.buf.subarray(head.headEnd + 4, total)) : Buffer.alloc(0);
-    conn.buf = Buffer.from(conn.buf.subarray(total));
+    conn.buf = total === conn.buf.length ? Buffer.alloc(0) : Buffer.from(conn.buf.subarray(total));
     const req: ForgeRequest = { method: head.method, url: head.url, headers: head.headers, body };
     const c = head.headers.connection;
     const closeAfter = (Array.isArray(c) ? c.join(',') : (c ?? '')).toLowerCase().includes('close');
