@@ -20,6 +20,7 @@ import {
   storeTreeFromFiles,
 } from './git.ts';
 import { branchRef, nowIso, refTip, shortRef, Store, VIEWER, viewerIdent, type IssueRec, type PullRec, type RepoRec } from './store.ts';
+import { addCommentRecord, createIssueRecord, performMerge, pullFilesList } from './core.ts';
 
 const store = new Store();
 const TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
@@ -543,140 +544,7 @@ function subtreeOid(repo: RepoRec, branch: string, prefix: string): string {
   return tree;
 }
 
-// ---------------------------------------------------------------- line diffs and 3-way merge
-
-/** LCS-based line diff counts between two texts. */
-function lineDiff(aText: string, bText: string): { additions: number; deletions: number } {
-  const a = aText === '' ? [] : aText.split('\n');
-  const b = bText === '' ? [] : bText.split('\n');
-  if (a.length > 4000 || b.length > 4000) return { additions: b.length, deletions: a.length };
-  const dp = new Uint32Array((a.length + 1) * (b.length + 1));
-  const W = b.length + 1;
-  for (let i = a.length - 1; i >= 0; i -= 1) {
-    for (let j = b.length - 1; j >= 0; j -= 1) {
-      dp[i * W + j] = a[i] === b[j] ? (dp[(i + 1) * W + j + 1] as number) + 1 : Math.max(dp[(i + 1) * W + j] as number, dp[i * W + j + 1] as number);
-    }
-  }
-  const lcs = dp[0] as number;
-  return { additions: b.length - lcs, deletions: a.length - lcs };
-}
-
-interface Hunk {
-  start: number; // first base line replaced
-  end: number; // one past the last base line replaced
-  lines: string[];
-}
-
-/** The edit hunks that turn base into other, in base coordinates. */
-function diffHunks(base: string[], other: string[]): Hunk[] {
-  const n = base.length;
-  const m = other.length;
-  const W = m + 1;
-  const dp = new Uint32Array((n + 1) * (m + 1));
-  for (let i = n - 1; i >= 0; i -= 1) {
-    for (let j = m - 1; j >= 0; j -= 1) {
-      dp[i * W + j] = base[i] === other[j] ? (dp[(i + 1) * W + j + 1] as number) + 1 : Math.max(dp[(i + 1) * W + j] as number, dp[i * W + j + 1] as number);
-    }
-  }
-  const hunks: Hunk[] = [];
-  let i = 0;
-  let j = 0;
-  let cur: Hunk | undefined;
-  const flush = (): void => {
-    if (cur) hunks.push(cur);
-    cur = undefined;
-  };
-  while (i < n || j < m) {
-    if (i < n && j < m && base[i] === other[j]) {
-      flush();
-      i += 1;
-      j += 1;
-    } else if (j < m && (i >= n || (dp[i * W + j + 1] as number) >= (dp[(i + 1) * W + j] as number))) {
-      if (!cur) cur = { start: i, end: i, lines: [] };
-      cur.lines.push(other[j] as string);
-      j += 1;
-    } else {
-      if (!cur) cur = { start: i, end: i, lines: [] };
-      cur.end = i + 1;
-      i += 1;
-    }
-  }
-  flush();
-  return hunks;
-}
-
-/** A line-based 3-way merge; undefined when the two sides conflict. */
-function merge3(baseText: string, oursText: string, theirsText: string): string | undefined {
-  if (oursText === theirsText) return oursText;
-  if (oursText === baseText) return theirsText;
-  if (theirsText === baseText) return oursText;
-  const base = baseText === '' ? [] : baseText.split('\n');
-  const oursHunks = diffHunks(base, oursText === '' ? [] : oursText.split('\n'));
-  const theirsHunks = diffHunks(base, theirsText === '' ? [] : theirsText.split('\n'));
-  const overlaps = (a: Hunk, b: Hunk): boolean => a.start < b.end && b.start < a.end;
-  for (const o of oursHunks) {
-    for (const t of theirsHunks) {
-      if (overlaps(o, t)) {
-        const sameChange = o.start === t.start && o.end === t.end && o.lines.join('\n') === t.lines.join('\n');
-        if (!sameChange) return undefined;
-      }
-    }
-  }
-  const all = [...oursHunks, ...theirsHunks].sort((a, b) => a.start - b.start);
-  const out: string[] = [];
-  let pos = 0;
-  const seen = new Set<string>();
-  for (const h of all) {
-    const key = `${h.start}:${h.end}:${h.lines.join('\n')}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    for (let k = pos; k < h.start; k += 1) out.push(base[k] as string);
-    out.push(...h.lines);
-    pos = Math.max(pos, h.end);
-  }
-  for (let k = pos; k < base.length; k += 1) out.push(base[k] as string);
-  return out.join('\n');
-}
-
-/** Merge two file maps against their common ancestor's; undefined on a content conflict. */
-function mergeFileMaps(
-  base: Map<string, { oid: string; mode: string }>,
-  ours: Map<string, { oid: string; mode: string }>,
-  theirs: Map<string, { oid: string; mode: string }>,
-): Map<string, { oid: string; mode: string }> | undefined {
-  const out = new Map<string, { oid: string; mode: string }>();
-  const paths = new Set([...base.keys(), ...ours.keys(), ...theirs.keys()]);
-  const text = (e: { oid: string } | undefined): string => (e ? (store.objects.get(e.oid)?.buf.toString('utf8') ?? '') : '');
-  for (const p of paths) {
-    const b = base.get(p);
-    const o = ours.get(p);
-    const t = theirs.get(p);
-    if (o?.oid === t?.oid) {
-      if (o) out.set(p, o);
-      continue;
-    }
-    if (b?.oid === o?.oid) {
-      if (t) out.set(p, t);
-      continue;
-    }
-    if (b?.oid === t?.oid) {
-      if (o) out.set(p, o);
-      continue;
-    }
-    // Both sides changed the path differently (including modify-vs-delete).
-    if (!o || !t) return undefined;
-    const merged = merge3(text(b), text(o), text(t));
-    if (merged === undefined) return undefined;
-    const oid = store.objects.store('blob', Buffer.from(merged, 'utf8'));
-    out.set(p, { oid, mode: o.mode });
-  }
-  return out;
-}
-
 // ---------------------------------------------------------------- REST: issues
-
-/** Comments left on pull requests through the issue-comment route, keyed repo:number. */
-const pullComments = new Map<string, import('./store.ts').CommentRec[]>();
 
 function commentJson(c: import('./store.ts').CommentRec): Record<string, unknown> {
   return { id: c.id, body: c.body, user: userJson(c.user), created_at: c.created_at, updated_at: c.updated_at };
@@ -693,21 +561,7 @@ function handleIssues(req: IncomingMessage, res: ServerResponse, url: URL, raw: 
       for (const label of labels) {
         if (!repo.labels.has(label)) return unprocessable(res, `Label "${label}" does not exist in this repository`);
       }
-      const ts = nowIso();
-      const issue: IssueRec = {
-        number: repo.nextNumber,
-        title: str(body.title),
-        body: str(body.body),
-        state: 'open',
-        labels,
-        comments: [],
-        user: VIEWER.login,
-        created_at: ts,
-        updated_at: ts,
-        closed_at: null,
-      };
-      repo.nextNumber += 1;
-      repo.issues.set(issue.number, issue);
+      const issue = createIssueRecord(repo, { title: str(body.title), body: str(body.body), labels });
       return sendJson(res, 201, issueJson(repo, issue));
     }
     if (method === 'GET') {
@@ -727,11 +581,10 @@ function handleIssues(req: IncomingMessage, res: ServerResponse, url: URL, raw: 
   if (!issueMatch) return notFound(res);
   const num = Number(issueMatch[1]);
   const issue = repo.issues.get(num);
-  const pull = repo.pulls.get(num);
   const isComments = issueMatch[2] === '/comments';
 
   if (isComments) {
-    const list = issue ? issue.comments : pull ? (pullComments.get(`${repo.id}:${num}`) ?? []) : undefined;
+    const list = store.commentsFor(repo, num);
     if (!list) return notFound(res);
     if (method === 'GET') {
       const page = pageOf(url);
@@ -740,10 +593,8 @@ function handleIssues(req: IncomingMessage, res: ServerResponse, url: URL, raw: 
     if (method === 'POST') {
       const body = parseJsonBody(res, raw);
       if (!body) return;
-      const ts = nowIso();
-      const comment = { id: store.nextCommentId(), body: str(body.body), user: VIEWER.login, created_at: ts, updated_at: ts };
-      list.push(comment);
-      if (pull && !issue) pullComments.set(`${repo.id}:${num}`, list);
+      const comment = addCommentRecord(store, repo, num, str(body.body));
+      if (!comment) return notFound(res);
       return sendJson(res, 201, commentJson(comment));
     }
     return notFound(res);
@@ -769,39 +620,6 @@ function handleIssues(req: IncomingMessage, res: ServerResponse, url: URL, raw: 
     return sendJson(res, 200, issueJson(repo, issue));
   }
   return notFound(res);
-}
-
-// ---------------------------------------------------------------- REST: pull requests
-
-function pullFiles(repo: RepoRec, pull: PullRec): Record<string, unknown>[] {
-  const baseTip = resolveCommit(repo, pull.baseRef) ?? pull.baseSha;
-  const headTip = resolveCommit(repo, pull.headRef) ?? pull.headSha;
-  const baseCommit = store.objects.get(baseTip);
-  const headCommit = store.objects.get(headTip);
-  if (!baseCommit || baseCommit.type !== 'commit' || !headCommit || headCommit.type !== 'commit') return [];
-  const baseFiles = new Map<string, { oid: string; mode: string }>();
-  for (const [p, e] of flattenTree(store.objects, parseCommit(baseCommit.buf).tree)) baseFiles.set(p, { oid: e.oid, mode: e.mode });
-  const headFiles = new Map<string, { oid: string; mode: string }>();
-  for (const [p, e] of flattenTree(store.objects, parseCommit(headCommit.buf).tree)) headFiles.set(p, { oid: e.oid, mode: e.mode });
-  const out: Record<string, unknown>[] = [];
-  const paths = new Set([...baseFiles.keys(), ...headFiles.keys()]);
-  for (const p of [...paths].sort()) {
-    const b = baseFiles.get(p);
-    const h = headFiles.get(p);
-    if (b?.oid === h?.oid) continue;
-    const bText = b ? (store.objects.get(b.oid)?.buf.toString('utf8') ?? '') : '';
-    const hText = h ? (store.objects.get(h.oid)?.buf.toString('utf8') ?? '') : '';
-    const { additions, deletions } = lineDiff(bText, hText);
-    out.push({
-      filename: p,
-      status: !b ? 'added' : !h ? 'removed' : 'modified',
-      additions,
-      deletions,
-      changes: additions + deletions,
-      sha: h?.oid ?? b?.oid ?? '',
-    });
-  }
-  return out;
 }
 
 function handlePulls(req: IncomingMessage, res: ServerResponse, url: URL, raw: Buffer, repo: RepoRec, rest: string): void {
@@ -860,7 +678,8 @@ function handlePulls(req: IncomingMessage, res: ServerResponse, url: URL, raw: B
 
   if (sub === '/files' && method === 'GET') {
     const page = pageOf(url);
-    return sendJson(res, 200, paginate(res, req, url, pullFiles(repo, pull), page));
+    const files = pullFilesList(store, repo, pull).map((f) => ({ ...f }));
+    return sendJson(res, 200, paginate(res, req, url, files, page));
   }
 
   if (sub === '/merge' && method === 'PUT') {
@@ -870,43 +689,10 @@ function handlePulls(req: IncomingMessage, res: ServerResponse, url: URL, raw: B
       return sendJson(res, 405, { message: 'Pull Request is not mergeable' });
     }
     const mergeMethod = str(body.merge_method) || 'merge';
-    const baseTip = resolveCommit(repo, pull.baseRef);
-    const headTip = resolveCommit(repo, pull.headRef) ?? pull.headSha;
-    if (!baseTip || !headTip) return sendJson(res, 405, { message: 'Pull Request is not mergeable' });
-    const baseOid = mergeBase(store.objects, baseTip, headTip);
-    const filesAt = (commitOid: string | undefined): Map<string, { oid: string; mode: string }> => {
-      const out = new Map<string, { oid: string; mode: string }>();
-      if (!commitOid) return out;
-      const c = store.objects.get(commitOid);
-      if (!c || c.type !== 'commit') return out;
-      for (const [p, e] of flattenTree(store.objects, parseCommit(c.buf).tree)) out.set(p, { oid: e.oid, mode: e.mode });
-      return out;
-    };
-    const mergedFiles = mergeFileMaps(filesAt(baseOid), filesAt(baseTip), filesAt(headTip));
-    if (!mergedFiles) {
+    const sha = performMerge(store, repo, pull, mergeMethod);
+    if (!sha) {
       return sendJson(res, 405, { message: 'Pull Request is not mergeable: conflicts must be resolved first' });
     }
-    const tree = storeTreeFromFiles(store.objects, mergedFiles);
-    const ident = viewerIdent();
-    let message: string;
-    let parents: string[];
-    if (mergeMethod === 'squash') {
-      message = `${pull.title} (#${pull.number})`;
-      parents = [baseTip];
-    } else {
-      message = `Merge pull request #${pull.number} from ${shortRef(pull.headRef)}`;
-      parents = [baseTip, headTip];
-    }
-    const buf = buildCommit({ tree, parents, author: ident, committer: ident, message });
-    const sha = store.objects.store('commit', buf);
-    repo.refs.set(branchRef(pull.baseRef), sha);
-    pull.state = 'closed';
-    pull.merged = true;
-    pull.merged_at = nowIso();
-    pull.merge_commit_sha = sha;
-    pull.baseSha = sha;
-    pull.updated_at = nowIso();
-    repo.updated_at = nowIso();
     return sendJson(res, 200, { sha, merged: true, message: 'Pull Request successfully merged' });
   }
 

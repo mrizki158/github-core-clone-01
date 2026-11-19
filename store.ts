@@ -92,6 +92,8 @@ export interface RepoRec {
 export class Store {
   readonly objects = new ObjectStore();
   readonly repos = new Map<string, RepoRec>();
+  /** Comments left on pull requests through the issue-comment route, keyed repoId:number. */
+  readonly pullComments = new Map<string, CommentRec[]>();
   private repoSeq = 0;
   private commentSeq = 0;
 
@@ -135,6 +137,18 @@ export class Store {
   nextCommentId(): number {
     this.commentSeq += 1;
     return this.commentSeq;
+  }
+
+  /** The comment list for an issue or pull request number (empty when neither exists). */
+  commentsFor(repo: RepoRec, number: number): CommentRec[] | undefined {
+    const issue = repo.issues.get(number);
+    if (issue) return issue.comments;
+    if (repo.pulls.has(number)) {
+      const key = `${repo.id}:${number}`;
+      if (!this.pullComments.has(key)) this.pullComments.set(key, []);
+      return this.pullComments.get(key);
+    }
+    return undefined;
   }
 }
 
