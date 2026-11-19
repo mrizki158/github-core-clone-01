@@ -36,14 +36,15 @@ function requestId(): string {
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
-  const text = body === undefined ? '' : `${JSON.stringify(body)}\n`;
+  // Encode once: the byte length comes from the same Buffer that is written.
+  const buf = body === undefined ? Buffer.alloc(0) : Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
   res.writeHead(status, {
     'content-type': JSON_TYPE,
     'x-github-request-id': requestId(),
-    ...(text ? { 'content-length': Buffer.byteLength(text) } : {}),
+    ...(buf.length > 0 ? { 'content-length': buf.length } : {}),
     ...headers,
   });
-  res.end(text);
+  res.end(buf);
 }
 
 function sendRaw(res: ServerResponse, status: number, body: Buffer, contentType: string, headers: Readonly<Record<string, string>> = {}): void {
@@ -73,10 +74,22 @@ function authed(req: IncomingMessage): boolean {
   return TOKEN === '' || token === TOKEN;
 }
 
-async function readBody(req: IncomingMessage): Promise<Buffer> {
+/**
+ * Read a request body. Small bodies usually arrive with the headers, so drain
+ * whatever is already buffered first and only wait on the stream when the
+ * message is not yet complete: the common case never yields to the event loop.
+ * Returns a Buffer directly when the body is already whole.
+ */
+function readBody(req: IncomingMessage): Promise<Buffer> | Buffer {
   const chunks: Buffer[] = [];
-  for await (const chunk of req) chunks.push(chunk as Buffer);
-  return Buffer.concat(chunks);
+  let chunk: Buffer | null;
+  while ((chunk = req.read() as Buffer | null) !== null) chunks.push(chunk);
+  if (req.complete) return Buffer.concat(chunks);
+  return new Promise<Buffer>((resolve, reject) => {
+    req.on('data', (c: Buffer) => chunks.push(c));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
 }
 
 /** Parse a JSON request body; on malformed JSON, answer 400 and return undefined. */
@@ -663,7 +676,12 @@ export function createApp(): Server {
           return;
         }
 
-        const raw = await readBody(req);
+        // GET/HEAD carry no body in this protocol, and a declared empty body
+        // needs no read either: answer without yielding to the event loop, so
+        // a read completes in the same tick its request arrived in.
+        const raw = method === 'GET' || method === 'HEAD' || req.headers['content-length'] === '0'
+          ? Buffer.alloc(0)
+          : await readBody(req);
 
         if (path === '/api/v3' || path.startsWith('/api/v3/')) {
           if (!authed(req)) {
