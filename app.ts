@@ -21,6 +21,7 @@ import {
 } from './git.ts';
 import { branchRef, nowIso, refTip, shortRef, Store, VIEWER, viewerIdent, type IssueRec, type PullRec, type RepoRec } from './store.ts';
 import { addCommentRecord, createIssueRecord, performMerge, pullFilesList } from './core.ts';
+import { executeGraphQL } from './graphql.ts';
 
 const store = new Store();
 const TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
@@ -781,8 +782,9 @@ export function createApp(): Server {
 
 // ---------------------------------------------------------------- surfaces still being built
 
-function handleGraphql(_req: IncomingMessage, res: ServerResponse, _raw: Buffer): void {
-  sendJson(res, 200, { data: {} });
+function handleGraphql(_req: IncomingMessage, res: ServerResponse, raw: Buffer): void {
+  const reply = executeGraphQL(store, raw);
+  sendJson(res, reply.status, reply.body);
 }
 
 function handleMcp(_req: IncomingMessage, res: ServerResponse, _raw: Buffer): void {
