@@ -1,3 +1,9 @@
+// Zyll's entry for make.fun's github-core-clone-01: a standalone GitHub-compatible git forge in one
+// Node process — git smart HTTP (upload-pack v2, receive-pack v0), the REST v3 surface under
+// /api/v3, a GraphQL v4 endpoint at /api/graphql and an MCP endpoint at /mcp, all over its own
+// object store with no git binary and no outside service. The scored work lives in app.ts, git.ts,
+// store.ts, core.ts, graphql.ts and mcp.ts; this file is only the harness lifecycle around them.
+//
 // The entry <-> env lifecycle, as env/src/wire.ts settles it: bind an ephemeral port, tell the env the
 // port it bound, then poll until the env says the trial is over and exit 0. Keep this file as it is:
 // the suite scores the server app.ts builds, and the lifecycle is the harness's, not the contest's.
