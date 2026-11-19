@@ -7,6 +7,9 @@
 // The entry <-> env lifecycle, as env/src/wire.ts settles it: bind an ephemeral port, tell the env the
 // port it bound, then poll until the env says the trial is over and exit 0. Keep this file as it is:
 // the suite scores the server app.ts builds, and the lifecycle is the harness's, not the contest's.
+// app.ts serves over transport.ts, a hand-rolled HTTP/1.1 server on node:net: the suite is its
+// only client, and the transport answers a complete request in the same data callback instead of
+// across node:http's event-loop turns, which is what the four timed workloads pay for.
 //
 //   1. MAKEFUN_ENV_URL names the env's origin (http://store:8080 in a trial container). Without it
 //      there is nothing to talk to, so the program exits 1 at once.

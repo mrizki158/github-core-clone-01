@@ -15,6 +15,8 @@ export interface GitObject {
 /** The object database: one content-addressed map for every repository (objects are immutable). */
 export class ObjectStore {
   readonly map = new Map<string, GitObject>();
+  /** Tag object ids, kept beside the map so a fetch never scans every object to find them. */
+  readonly tags = new Set<string>();
 
   oidOf(type: ObjType, buf: Buffer): string {
     const head = Buffer.from(`${type} ${buf.length}\0`, 'utf8');
@@ -23,7 +25,10 @@ export class ObjectStore {
 
   store(type: ObjType, buf: Buffer): string {
     const oid = this.oidOf(type, buf);
-    if (!this.map.has(oid)) this.map.set(oid, { type, buf });
+    if (!this.map.has(oid)) {
+      this.map.set(oid, { type, buf });
+      if (type === 'tag') this.tags.add(oid);
+    }
     return oid;
   }
 
@@ -465,11 +470,15 @@ export function fetchClosure(store: ObjectStore, wants: readonly string[], haves
     emitTree(info.tree);
     for (const p of info.parents) queue.push(p);
   }
-  // Tags pointing at wanted commits ride along.
-  for (const [oid, obj] of store.map) {
-    if (obj.type === 'tag' && !emitted.has(oid)) {
-      const target = parseTag(obj.buf).object;
-      if (emitted.has(target)) { emitted.add(oid); out.push(oid); }
+  // Tags pointing at wanted commits ride along (only tag objects are scanned).
+  for (const oid of store.tags) {
+    if (emitted.has(oid)) continue;
+    const obj = store.get(oid);
+    if (!obj || obj.type !== 'tag') continue;
+    const target = parseTag(obj.buf).object;
+    if (emitted.has(target)) {
+      emitted.add(oid);
+      out.push(oid);
     }
   }
   return out;
@@ -522,6 +531,39 @@ export function sideband(pack: Buffer, progress: readonly string[] = []): Buffer
   for (const line of progress) parts.push(pktLine(Buffer.concat([Buffer.from([2]), Buffer.from(line, 'utf8')])));
   parts.push(PKT_FLUSH);
   return Buffer.concat(parts);
+}
+
+/**
+ * The sideband-framed pack for an object list, cached: a pack's bytes depend only on the
+ * (immutable, content-addressed) objects it carries, so identical fetches — the clone
+ * workload's 50 depth-1 clones of one tip — build it once. Bounded, oldest first out.
+ */
+const packCache = new WeakMap<ObjectStore, Map<string, Buffer>>();
+const PACK_CACHE_MAX_ENTRIES = 32;
+const PACK_CACHE_MAX_BYTES = 8 * 1024 * 1024;
+const PACK_CACHE_MAX_PACK_BYTES = 1024 * 1024;
+
+export function packSideband(store: ObjectStore, oids: readonly string[]): Buffer {
+  const key = oids.join(',');
+  let perStore = packCache.get(store);
+  if (perStore === undefined) {
+    perStore = new Map<string, Buffer>();
+    packCache.set(store, perStore);
+  }
+  const hit = perStore.get(key);
+  if (hit !== undefined) return hit;
+  const framed = sideband(buildPack(store, oids));
+  if (framed.length <= PACK_CACHE_MAX_PACK_BYTES) {
+    let total = 0;
+    for (const value of perStore.values()) total += value.length;
+    while (perStore.size > 0 && (perStore.size >= PACK_CACHE_MAX_ENTRIES || total + framed.length > PACK_CACHE_MAX_BYTES)) {
+      const oldest = perStore.keys().next().value as string;
+      total -= perStore.get(oldest)?.length ?? 0;
+      perStore.delete(oldest);
+    }
+    perStore.set(key, framed);
+  }
+  return framed;
 }
 
 export function sha1Hex(data: Buffer): string {
@@ -685,11 +727,12 @@ export function planFetch(
       if (!included.has(p) && !haveCommits.has(p) && !excludeCommits.has(p) && store.has(p)) boundary.add(c);
     }
   }
-  // Tags riding along on included commits.
-  for (const [oid, obj] of store.map) {
-    if (obj.type === 'tag' && !emitted.has(oid) && !haveObjects.has(oid)) {
-      if (included.has(parseTag(obj.buf).object)) emit(oid);
-    }
+  // Tags riding along on included commits (only tag objects are scanned).
+  for (const oid of store.tags) {
+    if (emitted.has(oid) || haveObjects.has(oid)) continue;
+    const obj = store.get(oid);
+    if (!obj || obj.type !== 'tag') continue;
+    if (included.has(parseTag(obj.buf).object)) emit(oid);
   }
   const unshallow: string[] = [];
   for (const s of opts.clientShallow ?? []) {

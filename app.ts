@@ -1,10 +1,12 @@
 // The forge's HTTP surface: git smart HTTP, REST v3, GraphQL v4 and MCP in one process over
-// the store in store.ts and the object engine in git.ts.
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+// the store in store.ts and the object engine in git.ts. The transport is a
+// hand-rolled HTTP/1.1 server (transport.ts): it hands the dispatcher complete
+// requests, so no body is ever read here.
+import type { Server } from 'node:net';
+import { createTransport, type ForgeRequest, type ForgeResponse } from './transport.ts';
 import {
   ancestors,
   buildCommit,
-  buildPack,
   flattenTree,
   isAncestor,
   mergeBase,
@@ -12,12 +14,12 @@ import {
   parsePack,
   parsePkts,
   parseTree,
+  packSideband,
   peelToCommit,
   pktLine,
   planFetch,
   PKT_DELIM,
   PKT_FLUSH,
-  sideband,
   storeTreeFromFiles,
 } from './git.ts';
 import { branchRef, nowIso, refTip, shortRef, Store, VIEWER, viewerIdent, type IssueRec, type PullRec, type RepoRec } from './store.ts';
@@ -35,7 +37,7 @@ function requestId(): string {
   return `req-${requestSeq.toString(16).padStart(8, '0')}`;
 }
 
-function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
+function sendJson(res: ForgeResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
   // Encode once: the byte length comes from the same Buffer that is written.
   const buf = body === undefined ? Buffer.alloc(0) : Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
   res.writeHead(status, {
@@ -47,7 +49,7 @@ function sendJson(res: ServerResponse, status: number, body: unknown, headers: R
   res.end(buf);
 }
 
-function sendRaw(res: ServerResponse, status: number, body: Buffer, contentType: string, headers: Readonly<Record<string, string>> = {}): void {
+function sendRaw(res: ForgeResponse, status: number, body: Buffer, contentType: string, headers: Readonly<Record<string, string>> = {}): void {
   res.writeHead(status, {
     'content-type': contentType,
     'content-length': body.length,
@@ -57,16 +59,16 @@ function sendRaw(res: ServerResponse, status: number, body: Buffer, contentType:
   res.end(body);
 }
 
-function notFound(res: ServerResponse): void {
+function notFound(res: ForgeResponse): void {
   sendJson(res, 404, { message: 'Not Found' });
 }
 
-function unprocessable(res: ServerResponse, message: string): void {
+function unprocessable(res: ForgeResponse, message: string): void {
   sendJson(res, 422, { message });
 }
 
 /** The bearer token's validity: missing and wrong are both 401. */
-function authed(req: IncomingMessage): boolean {
+function authed(req: ForgeRequest): boolean {
   const header = req.headers.authorization;
   if (!header || !header.startsWith('Bearer ')) return false;
   const token = header.slice('Bearer '.length).trim();
@@ -74,26 +76,8 @@ function authed(req: IncomingMessage): boolean {
   return TOKEN === '' || token === TOKEN;
 }
 
-/**
- * Read a request body. Small bodies usually arrive with the headers, so drain
- * whatever is already buffered first and only wait on the stream when the
- * message is not yet complete: the common case never yields to the event loop.
- * Returns a Buffer directly when the body is already whole.
- */
-function readBody(req: IncomingMessage): Promise<Buffer> | Buffer {
-  const chunks: Buffer[] = [];
-  let chunk: Buffer | null;
-  while ((chunk = req.read() as Buffer | null) !== null) chunks.push(chunk);
-  if (req.complete) return Buffer.concat(chunks);
-  return new Promise<Buffer>((resolve, reject) => {
-    req.on('data', (c: Buffer) => chunks.push(c));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
-  });
-}
-
 /** Parse a JSON request body; on malformed JSON, answer 400 and return undefined. */
-function parseJsonBody(res: ServerResponse, raw: Buffer): Record<string, unknown> | undefined {
+function parseJsonBody(res: ForgeResponse, raw: Buffer): Record<string, unknown> | undefined {
   if (raw.length === 0) return {};
   try {
     const value = JSON.parse(raw.toString('utf8')) as unknown;
@@ -150,7 +134,7 @@ function pageOf(url: URL): Page {
   return { page, perPage };
 }
 
-function paginate<T>(res: ServerResponse, req: IncomingMessage, url: URL, items: T[], page: Page): T[] {
+function paginate<T>(res: ForgeResponse, req: ForgeRequest, url: URL, items: T[], page: Page): T[] {
   const totalPages = Math.max(1, Math.ceil(items.length / page.perPage));
   const start = (page.page - 1) * page.perPage;
   const slice = items.slice(start, start + page.perPage);
@@ -214,7 +198,7 @@ function resolveCommit(repo: RepoRec, ref: string): string | undefined {
 
 // ---------------------------------------------------------------- REST: repositories
 
-function handleRest(req: IncomingMessage, res: ServerResponse, url: URL, raw: Buffer): void {
+function handleRest(req: ForgeRequest, res: ForgeResponse, url: URL, raw: Buffer): void {
   const path = url.pathname;
   const method = req.method ?? 'GET';
 
@@ -364,7 +348,7 @@ function handleRest(req: IncomingMessage, res: ServerResponse, url: URL, raw: Bu
 
 // ---------------------------------------------------------------- REST: contents
 
-function handleContents(req: IncomingMessage, res: ServerResponse, url: URL, raw: Buffer, repo: RepoRec, filePath: string): void {
+function handleContents(req: ForgeRequest, res: ForgeResponse, url: URL, raw: Buffer, repo: RepoRec, filePath: string): void {
   const method = req.method ?? 'GET';
   const branchParam = (method === 'GET' ? url.searchParams.get('ref') : null) ?? undefined;
 
@@ -491,7 +475,7 @@ function commentJson(c: import('./store.ts').CommentRec): Record<string, unknown
   return { id: c.id, body: c.body, user: userJson(c.user), created_at: c.created_at, updated_at: c.updated_at };
 }
 
-function handleIssues(req: IncomingMessage, res: ServerResponse, url: URL, raw: Buffer, repo: RepoRec, rest: string): void {
+function handleIssues(req: ForgeRequest, res: ForgeResponse, url: URL, raw: Buffer, repo: RepoRec, rest: string): void {
   const method = req.method ?? 'GET';
 
   if (rest === '/issues') {
@@ -563,7 +547,7 @@ function handleIssues(req: IncomingMessage, res: ServerResponse, url: URL, raw: 
   return notFound(res);
 }
 
-function handlePulls(req: IncomingMessage, res: ServerResponse, url: URL, raw: Buffer, repo: RepoRec, rest: string): void {
+function handlePulls(req: ForgeRequest, res: ForgeResponse, url: URL, raw: Buffer, repo: RepoRec, rest: string): void {
   const method = req.method ?? 'GET';
 
   if (rest === '/pulls') {
@@ -664,8 +648,11 @@ function handlePulls(req: IncomingMessage, res: ServerResponse, url: URL, raw: B
 
 /** Build the server. It binds nothing until the caller listens. */
 export function createApp(): Server {
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
-    void (async (): Promise<void> => {
+  return createTransport((req: ForgeRequest, res: ForgeResponse) => {
+    // Return the promise: the transport keeps this socket's requests in
+    // order until it settles. Every response is still written synchronously
+    // inside the handler, before its first await.
+    return (async (): Promise<void> => {
       try {
         const url = new URL(req.url ?? '/', 'http://entry');
         const path = url.pathname;
@@ -676,12 +663,9 @@ export function createApp(): Server {
           return;
         }
 
-        // GET/HEAD carry no body in this protocol, and a declared empty body
-        // needs no read either: answer without yielding to the event loop, so
-        // a read completes in the same tick its request arrived in.
-        const raw = method === 'GET' || method === 'HEAD' || req.headers['content-length'] === '0'
-          ? Buffer.alloc(0)
-          : await readBody(req);
+        // The transport delivers the whole body with the request: nothing is
+        // read here, so a GET answers in the same tick its request arrived in.
+        const raw = req.body;
 
         if (path === '/api/v3' || path.startsWith('/api/v3/')) {
           if (!authed(req)) {
@@ -727,12 +711,12 @@ export function createApp(): Server {
 
 // ---------------------------------------------------------------- surfaces still being built
 
-function handleGraphql(_req: IncomingMessage, res: ServerResponse, raw: Buffer): void {
+function handleGraphql(_req: ForgeRequest, res: ForgeResponse, raw: Buffer): void {
   const reply = executeGraphQL(store, raw);
   sendJson(res, reply.status, reply.body);
 }
 
-function handleMcp(req: IncomingMessage, res: ServerResponse, raw: Buffer): void {
+function handleMcp(req: ForgeRequest, res: ForgeResponse, raw: Buffer): void {
   if ((req.method ?? 'GET') !== 'POST') {
     sendJson(res, 405, { message: 'Method Not Allowed' });
     return;
@@ -817,7 +801,7 @@ function v2Advertisement(repo: RepoRec): Buffer {
   return Buffer.concat(parts);
 }
 
-function handleInfoRefs(req: IncomingMessage, res: ServerResponse, url: URL, repo: RepoRec): void {
+function handleInfoRefs(req: ForgeRequest, res: ForgeResponse, url: URL, repo: RepoRec): void {
   const service = url.searchParams.get('service');
   if (service !== 'git-upload-pack' && service !== 'git-receive-pack') return notFound(res);
   const wantsV2 = (req.headers['git-protocol'] ?? '').includes('version=2');
@@ -858,7 +842,7 @@ function v2Sections(raw: Buffer): { head: string[]; args: string[] } {
   return { head, args };
 }
 
-function handleLsRefs(res: ServerResponse, repo: RepoRec, raw: Buffer): void {
+function handleLsRefs(res: ForgeResponse, repo: RepoRec, raw: Buffer): void {
   const { args } = v2Sections(raw);
   let peel = false;
   let symrefs = false;
@@ -900,7 +884,7 @@ function handleLsRefs(res: ServerResponse, repo: RepoRec, raw: Buffer): void {
   sendRaw(res, 200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
 }
 
-async function handleFetch(res: ServerResponse, repo: RepoRec, raw: Buffer, version2: boolean): Promise<void> {
+async function handleFetch(res: ForgeResponse, repo: RepoRec, raw: Buffer, version2: boolean): Promise<void> {
   if (!version2) return handleFetchV0(res, repo, raw);
   const { args } = v2Sections(raw);
   const wants: string[] = [];
@@ -950,11 +934,11 @@ async function handleFetch(res: ServerResponse, repo: RepoRec, raw: Buffer, vers
     parts.push(PKT_DELIM);
   }
   parts.push(pktLine('packfile\n'));
-  parts.push(sideband(buildPack(store.objects, plan.objects)));
+  parts.push(packSideband(store.objects, plan.objects));
   return sendRaw(res, 200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
 }
 
-function handleFetchV0(res: ServerResponse, repo: RepoRec, raw: Buffer): void {
+function handleFetchV0(res: ForgeResponse, repo: RepoRec, raw: Buffer): void {
   const { texts } = pktTexts(raw);
   const wants: string[] = [];
   const haves: string[] = [];
@@ -981,11 +965,11 @@ function handleFetchV0(res: ServerResponse, repo: RepoRec, raw: Buffer): void {
   for (const s of plan.shallow) parts.push(pktLine(`shallow ${s}\n`));
   for (const u of plan.unshallow) parts.push(pktLine(`unshallow ${u}\n`));
   parts.push(pktLine('NAK\n'));
-  parts.push(sideband(buildPack(store.objects, plan.objects)));
+  parts.push(packSideband(store.objects, plan.objects));
   sendRaw(res, 200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
 }
 
-async function handleReceivePack(res: ServerResponse, repo: RepoRec, raw: Buffer): Promise<void> {
+async function handleReceivePack(res: ForgeResponse, repo: RepoRec, raw: Buffer): Promise<void> {
   const { pkts, rest } = parsePkts(raw);
   interface Cmd {
     oldOid: string;
@@ -1094,7 +1078,7 @@ async function handleReceivePack(res: ServerResponse, repo: RepoRec, raw: Buffer
   return sendRaw(res, 200, report, 'application/x-git-receive-pack-result');
 }
 
-async function handleGitHttp(req: IncomingMessage, res: ServerResponse, url: URL, raw: Buffer): Promise<void> {
+async function handleGitHttp(req: ForgeRequest, res: ForgeResponse, url: URL, raw: Buffer): Promise<void> {
   const match = /^\/([^/]+)\/([^/]+)\.git(\/.*)?$/.exec(url.pathname);
   if (!match) return notFound(res);
   const owner = decodeURIComponent(match[1] as string);
