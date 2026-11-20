@@ -42,6 +42,9 @@ export interface ForgeResponse {
 
 export type ForgeHandler = (req: ForgeRequest, res: ForgeResponse) => void | Promise<void>;
 
+/** Shared empty buffer for bodyless requests and drained connections. */
+const EMPTY_BODY = Buffer.alloc(0);
+
 const REASONS: Record<number, string> = {
   200: 'OK',
   201: 'Created',
@@ -136,15 +139,28 @@ function makeResponse(conn: Conn, method: string, closeAfter: boolean): ForgeRes
   const write = (body: Buffer): void => {
     const isHead = method === 'HEAD';
     const lines: string[] = [`HTTP/1.1 ${status} ${REASONS[status] ?? ''}`];
-    const all: Record<string, string | number | string[]> = { ...stored, ...head };
-    if (status !== 204 && all['content-length'] === undefined) all['content-length'] = body.length;
-    if (!closeAfter) all.connection = 'keep-alive';
-    for (const [name, value] of Object.entries(all)) {
+    const pushHeader = (name: string, value: string | number | string[]): void => {
       if (Array.isArray(value)) {
         for (const v of value) lines.push(`${name}: ${v}`);
       } else {
         lines.push(`${name}: ${value}`);
       }
+    };
+    if (Object.keys(stored).length === 0) {
+      // Fast path (no setHeader calls, the common case): walk the writeHead
+      // record directly instead of merging two records into a third.
+      let hasContentLength = false;
+      for (const [name, value] of Object.entries(head)) {
+        if (name === 'content-length') hasContentLength = true;
+        pushHeader(name, value);
+      }
+      if (status !== 204 && !hasContentLength) lines.push(`content-length: ${body.length}`);
+      if (!closeAfter) lines.push('connection: keep-alive');
+    } else {
+      const all: Record<string, string | number | string[]> = { ...stored, ...head };
+      if (status !== 204 && all['content-length'] === undefined) all['content-length'] = body.length;
+      if (!closeAfter) all.connection = 'keep-alive';
+      for (const [name, value] of Object.entries(all)) pushHeader(name, value);
     }
     const headBuf = Buffer.from(`${lines.join('\r\n')}\r\n\r\n`, 'latin1');
     const out = status === 204 || isHead || body.length === 0 ? headBuf : Buffer.concat([headBuf, body]);
@@ -207,8 +223,10 @@ function pump(conn: Conn): void {
       return;
     }
     conn.answered100 = false;
-    const body = head.contentLength > 0 ? Buffer.from(conn.buf.subarray(head.headEnd + 4, total)) : Buffer.alloc(0);
-    conn.buf = total === conn.buf.length ? Buffer.alloc(0) : Buffer.from(conn.buf.subarray(total));
+    // Views, not copies: nothing downstream mutates the request bytes, and the
+    // remainder slice stays valid because the buffer is never written to.
+    const body = head.contentLength > 0 ? conn.buf.subarray(head.headEnd + 4, total) : EMPTY_BODY;
+    conn.buf = total === conn.buf.length ? EMPTY_BODY : conn.buf.subarray(total);
     const req: ForgeRequest = { method: head.method, url: head.url, headers: head.headers, body };
     const c = head.headers.connection;
     const closeAfter = (Array.isArray(c) ? c.join(',') : (c ?? '')).toLowerCase().includes('close');

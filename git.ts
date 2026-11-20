@@ -354,6 +354,16 @@ export function parsePack(store: ObjectStore, pack: Buffer): number {
     }
     typeNum = typeNum; // no-op, keeps the variable visibly used
   }
+  // Fast path: a pack of whole objects (the common receive-pack case) stores in order,
+  // with none of the delta-resolution bookkeeping.
+  let hasDelta = false;
+  for (const e of raw) {
+    if (e.baseOid !== undefined || e.baseOffset !== undefined) { hasDelta = true; break; }
+  }
+  if (!hasDelta) {
+    for (const e of raw) store.store(e.type, e.buf);
+    return count;
+  }
   // Resolve in passes: an entry is ready when it is whole, or its base is already resolved.
   const byOffset = new Map<number, PackEntry>();
   for (const e of raw) byOffset.set(e.offset, e);
@@ -486,11 +496,20 @@ export function fetchClosure(store: ObjectStore, wants: readonly string[], haves
 
 // ---------------------------------------------------------------- pkt-lines
 
+const HEX_DIGITS = '0123456789abcdef';
+
+/** One pkt-line in a single allocation: 4 hex length digits, then the payload bytes. */
 export function pktLine(payload: Buffer | string): Buffer {
-  const body = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
-  const len = body.length + 4;
-  const head = Buffer.from(len.toString(16).padStart(4, '0'), 'ascii');
-  return Buffer.concat([head, body]);
+  const bodyLen = typeof payload === 'string' ? Buffer.byteLength(payload, 'utf8') : payload.length;
+  const len = bodyLen + 4;
+  const out = Buffer.allocUnsafe(len);
+  out[0] = HEX_DIGITS.charCodeAt((len >> 12) & 0xf);
+  out[1] = HEX_DIGITS.charCodeAt((len >> 8) & 0xf);
+  out[2] = HEX_DIGITS.charCodeAt((len >> 4) & 0xf);
+  out[3] = HEX_DIGITS.charCodeAt(len & 0xf);
+  if (typeof payload === 'string') out.write(payload, 4, 'utf8');
+  else payload.copy(out, 4);
+  return out;
 }
 
 export const PKT_FLUSH = Buffer.from('0000', 'ascii');
@@ -502,17 +521,29 @@ export interface Pkt {
   data: Buffer;
 }
 
+const EMPTY_BUFFER = Buffer.alloc(0);
+
+/** The hex value of one ASCII byte, or -1 when it is not a lowercase hex digit (as git writes). */
+function hexValue(byte: number): number {
+  if (byte >= 0x30 && byte <= 0x39) return byte - 0x30;
+  if (byte >= 0x61 && byte <= 0x66) return byte - 0x61 + 10;
+  return -1;
+}
+
 /** Parse as many pkt-lines as the buffer holds; returns them plus the unparsed remainder. */
 export function parsePkts(buf: Buffer): { pkts: Pkt[]; rest: Buffer } {
   const pkts: Pkt[] = [];
   let i = 0;
   while (i + 4 <= buf.length) {
-    const head = buf.toString('ascii', i, i + 4);
-    if (!/^[0-9a-f]{4}$/.test(head)) break;
-    const len = parseInt(head, 16);
-    if (len === 0) { pkts.push({ kind: 'flush', data: Buffer.alloc(0) }); i += 4; continue; }
-    if (len === 1) { pkts.push({ kind: 'delim', data: Buffer.alloc(0) }); i += 4; continue; }
-    if (len === 2) { pkts.push({ kind: 'response-end', data: Buffer.alloc(0) }); i += 4; continue; }
+    const a = hexValue(buf[i] as number);
+    const b = hexValue(buf[i + 1] as number);
+    const c = hexValue(buf[i + 2] as number);
+    const d = hexValue(buf[i + 3] as number);
+    if (a < 0 || b < 0 || c < 0 || d < 0) break;
+    const len = (a << 12) | (b << 8) | (c << 4) | d;
+    if (len === 0) { pkts.push({ kind: 'flush', data: EMPTY_BUFFER }); i += 4; continue; }
+    if (len === 1) { pkts.push({ kind: 'delim', data: EMPTY_BUFFER }); i += 4; continue; }
+    if (len === 2) { pkts.push({ kind: 'response-end', data: EMPTY_BUFFER }); i += 4; continue; }
     if (len < 4 || i + len > buf.length) break;
     pkts.push({ kind: 'data', data: buf.subarray(i + 4, i + len) });
     i += len;

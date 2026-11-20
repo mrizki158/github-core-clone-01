@@ -93,6 +93,22 @@ function str(value: unknown): string {
   return typeof value === 'string' ? value : '';
 }
 
+/** One query parameter from a raw query string (no leading '?'), decoded; null when absent. */
+function queryParam(query: string, name: string): string | null {
+  if (query === '') return null;
+  for (const pair of query.split('&')) {
+    const eq = pair.indexOf('=');
+    if (eq <= 0 || pair.slice(0, eq) !== name) continue;
+    const value = pair.slice(eq + 1);
+    try {
+      return decodeURIComponent(value.replace(/\+/g, ' '));
+    } catch {
+      return value;
+    }
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------- JSON shapes
 
 function identParts(ident: string): { name: string; email: string; date: string } {
@@ -654,8 +670,14 @@ export function createApp(): Server {
     // inside the handler, before its first await.
     return (async (): Promise<void> => {
       try {
-        const url = new URL(req.url ?? '/', 'http://entry');
-        const path = url.pathname;
+        // Split the target by hand: a WHATWG URL parse per request is pure
+        // overhead on the git routes, which need only the path and one query
+        // parameter. Only the REST branch (pagination, query filters) builds
+        // a URL, lazily, below.
+        const target = req.url ?? '/';
+        const qIdx = target.indexOf('?');
+        const path = qIdx === -1 ? target : target.slice(0, qIdx);
+        const query = qIdx === -1 ? '' : target.slice(qIdx + 1);
         const method = req.method ?? 'GET';
 
         if (method === 'GET' && path === '/healthz') {
@@ -672,7 +694,7 @@ export function createApp(): Server {
             sendJson(res, 401, { message: 'Requires authentication' });
             return;
           }
-          handleRest(req, res, url, raw);
+          handleRest(req, res, new URL(target, 'http://entry'), raw);
           return;
         }
         if (path === '/api/graphql') {
@@ -696,7 +718,7 @@ export function createApp(): Server {
             sendJson(res, 401, { message: 'Requires authentication' });
             return;
           }
-          await handleGitHttp(req, res, url, raw);
+          await handleGitHttp(req, res, path, query, raw);
           return;
         }
         notFound(res);
@@ -786,27 +808,25 @@ function v0Advertisement(repo: RepoRec, service: 'git-upload-pack' | 'git-receiv
   return Buffer.concat(parts);
 }
 
-function v2Advertisement(repo: RepoRec): Buffer {
-  const parts: Buffer[] = [
-    pktLine('# service=git-upload-pack\n'),
-    PKT_FLUSH,
-    pktLine('version 2\n'),
-    pktLine(`agent=${AGENT}\n`),
-    pktLine('ls-refs=unborn\n'),
-    pktLine('fetch=shallow wait-for-done\n'),
-    pktLine('server-option\n'),
-    pktLine('object-format=sha1\n'),
-    PKT_FLUSH,
-  ];
-  return Buffer.concat(parts);
-}
+/** The v2 capability advertisement is the same bytes for every repository: build it once. */
+const V2_ADVERTISEMENT: Buffer = Buffer.concat([
+  pktLine('# service=git-upload-pack\n'),
+  PKT_FLUSH,
+  pktLine('version 2\n'),
+  pktLine(`agent=${AGENT}\n`),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow wait-for-done\n'),
+  pktLine('server-option\n'),
+  pktLine('object-format=sha1\n'),
+  PKT_FLUSH,
+]);
 
-function handleInfoRefs(req: ForgeRequest, res: ForgeResponse, url: URL, repo: RepoRec): void {
-  const service = url.searchParams.get('service');
+function handleInfoRefs(req: ForgeRequest, res: ForgeResponse, query: string, repo: RepoRec): void {
+  const service = queryParam(query, 'service');
   if (service !== 'git-upload-pack' && service !== 'git-receive-pack') return notFound(res);
   const wantsV2 = (req.headers['git-protocol'] ?? '').includes('version=2');
   if (service === 'git-upload-pack' && wantsV2) {
-    return sendRaw(res, 200, v2Advertisement(repo), 'application/x-git-upload-pack-advertisement');
+    return sendRaw(res, 200, V2_ADVERTISEMENT, 'application/x-git-upload-pack-advertisement');
   }
   const body = v0Advertisement(repo, service);
   return sendRaw(res, 200, body, `application/x-${service}-advertisement`);
@@ -990,8 +1010,9 @@ async function handleReceivePack(res: ForgeResponse, repo: RepoRec, raw: Buffer)
     const fields = text.split(' ');
     if (fields.length === 3) commands.push({ oldOid: fields[0] as string, newOid: fields[1] as string, ref: fields[2] as string });
   }
-  const useSideband = caps.split(' ').includes('side-band-64k');
-  const wantReport = caps.split(' ').includes('report-status') || caps.split(' ').includes('report-status-v2');
+  const capList = caps === '' ? [] : caps.split(' ');
+  const useSideband = capList.includes('side-band-64k');
+  const wantReport = capList.includes('report-status') || capList.includes('report-status-v2');
 
   let unpackLine = 'unpack ok\n';
   if (rest.length > 0) {
@@ -1078,8 +1099,8 @@ async function handleReceivePack(res: ForgeResponse, repo: RepoRec, raw: Buffer)
   return sendRaw(res, 200, report, 'application/x-git-receive-pack-result');
 }
 
-async function handleGitHttp(req: ForgeRequest, res: ForgeResponse, url: URL, raw: Buffer): Promise<void> {
-  const match = /^\/([^/]+)\/([^/]+)\.git(\/.*)?$/.exec(url.pathname);
+async function handleGitHttp(req: ForgeRequest, res: ForgeResponse, path: string, query: string, raw: Buffer): Promise<void> {
+  const match = /^\/([^/]+)\/([^/]+)\.git(\/.*)?$/.exec(path);
   if (!match) return notFound(res);
   const owner = decodeURIComponent(match[1] as string);
   const name = decodeURIComponent(match[2] as string);
@@ -1087,7 +1108,7 @@ async function handleGitHttp(req: ForgeRequest, res: ForgeResponse, url: URL, ra
   const repo = owner === VIEWER.login ? store.getRepo(owner, name) : undefined;
   if (!repo) return notFound(res);
 
-  if (rest === '/info/refs' && (req.method ?? 'GET') === 'GET') return handleInfoRefs(req, res, url, repo);
+  if (rest === '/info/refs' && (req.method ?? 'GET') === 'GET') return handleInfoRefs(req, res, query, repo);
   if (rest === '/git-upload-pack' && (req.method ?? 'GET') === 'POST') {
     const version2 = (req.headers['git-protocol'] ?? '').includes('version=2');
     // A v2 command request names its command in the first section.
